@@ -14,19 +14,25 @@ use DBI;
 use Try::Tiny;
 use Term::ProgressBar;
 use File::Copy;
+use File::HomeDir;
 use Moose;
+use DateTime::Format::DateParse;
+use DateTime::Format::Epoch;
+use Config::Simple;
+use Data::Dumper;
 
 
 with 'MooseX::Getopt';
 
-has key => ( is => "rw", isa => "Str", required => 1 );
-has username => ( is => "rw", isa => "Str", required => 1 );
-has db => ( is => "rw", isa => "Str", required => 1 );
+has key => ( is => "rw", isa => "Str", required => 0, default => "b25b959554ed76058ac220b7b2e0a026" );
+has username => ( is => "rw", isa => "Str", required => 0);
+has db => ( is => "rw", isa => "Str", required => 0);
 has zero => ( is => "rw", isa => "Bool", required => 0, default => sub { 0 } );
 has updateloved => ( is=> "rw", isa => "Bool", required => 0, default => sub { 0 });
 has lovedrating => ( is => "rw", isa => "Int", required => 0, default => sub { 5 });
 has _config => ( is => "rw", lazy_build => 1, required => 0 );
 has debug => ( is => "rw", isa => "Bool", default => sub{ 0 }, accessor => "debug" );
+has conf => ( is => "rw", isa => "Str", required => 0, default => File::HomeDir::my_home()."/.config/banshee-1/lastfm_sync.conf" );
 
 __PACKAGE__->meta->make_immutable;
 binmode STDOUT, ":utf8";
@@ -49,19 +55,29 @@ sub _build_config {
 sub backup {
 	my ( $self ) = @_;
 
+	my $cfg;
+	my $bdb;
+	if (-e $self->conf) {
+		$cfg = new Config::Simple($self->conf);
+		$bdb = ($self->db ? $self->db : $cfg->param('db'));
+	} else {
+		$cfg = new Config::Simple(syntax=>'ini');
+		$bdb = ($self->db ? $self->db : File::HomeDir::my_home()."/.config/banshee-1/banshee.db");
+		$cfg->param('db',$bdb);
+	}
 	#
 	# check if database file exists
 	#
-	unless( -f $self->db ) {
-		say "Database file ${\$self->db} doesn't exists";
+	unless( -f $bdb ) {
+		say "Database file ${\$bdb} doesn't exists";
 		exit(1);
 	}
 
 	#
 	# just copy file with .backup postfix
 	#
-	my $backup = sprintf "%s.backup", $self->db;
-	copy( $self->db, $backup );
+	my $backup = sprintf "%s.backup", $bdb;
+	copy( $bdb, $backup );
 	say "Creating backup $backup";
 }
 
@@ -74,6 +90,50 @@ sub sync {
 	my $counter = 1;
 	my $total   = 0;
 	my $changed = 0;
+
+	#
+	# DateTime parser for comparing LastPlayed dates
+	#
+	my $epoch_startdt = DateTime->new( year => 1970, month => 1, day => 1 );
+	my $epoch_parser = DateTime::Format::Epoch->new(epoch => $epoch_startdt);
+
+	#
+	# Read config file to determine when sync was previously run.
+	# We only want to sync tracks scrobbled since the last sync.
+	#
+	my $cfg;
+	my $last_update;
+	my $bdb;
+	my $username;
+	my $limit = 250;
+
+	if (-e $self->conf) {
+		say "Loading configuration from " . $self->conf . "\n" if $self->debug;
+		$cfg = new Config::Simple($self->conf);
+		$last_update = $cfg->param('last_update');
+		$username = ($self->username ? $self->username : $cfg->param('username'));
+		$bdb = ($self->db ? $self->db : $cfg->param('db'));
+		$limit = ($cfg->param('limit') ? $cfg->param('limit') : $limit);
+		say "Last synced on " . $epoch_parser->parse_datetime($last_update)->ymd . "\n" if $self->debug;
+	} else {
+# Create a new config file
+		$cfg = new Config::Simple(syntax=>'ini');
+
+		$last_update = 0;
+		$cfg->param('last_update',$last_update);
+
+		$username = $self->username;
+		$cfg->param('username',$username);
+
+		$bdb = ($self->db ? $self->db : File::HomeDir::my_home()."/.config/banshee-1/banshee.db");
+		$cfg->param('db',$bdb);
+
+		$cfg->param('limit',$limit);
+	}
+	if (!$username) {
+		say "Error: user name not specified.\n";
+		exit(1);
+	}
 
 	#
 	# allow only rating from 1 to 5
@@ -92,15 +152,15 @@ sub sync {
 	#
 	# check if database file exists
 	#
-	unless( -f $self->db ) {
-		say "Database file ${\$self->db} doesn't exists";
+	unless( -f $bdb ) {
+		say "Database file ${\$bdb} doesn't exists";
 		exit(1);
 	}
 
 	#
 	# iterate on track
 	#
-	my $dbh = DBI->connect( sprintf("dbi:SQLite:dbname=%s", $self->db ) , "", "" );
+	my $dbh = DBI->connect( sprintf("dbi:SQLite:dbname=%s", $bdb ) , "", "" );
 	$dbh->{sqlite_unicode} = 1;
 
 	#
@@ -153,9 +213,10 @@ sub sync {
 	my $libCounter = 0;
 	try {
 		$libResponse = lastfm_iter(
-			"library.getTracks",
-			user => $self->username,
-			limit => 250
+			"user.getRecentTracks",
+			user => $username,
+			limit => $limit,
+			from => $last_update
 		);
 	};
 
@@ -164,19 +225,41 @@ sub sync {
 		exit(1);
 	}
 
-	my $libProgress = Term::ProgressBar->new( { count => $Net::LastFMAPI::last_response->{"tracks"}->{"\@attr"}->{"total"}, name => "Fetching Last.fm library", ETA => "linear" } );
+	my $total_scrobbles = $Net::LastFMAPI::last_response->{"recenttracks"}->{"\@attr"}->{"total"};
+	say "Total scrobbled tracks on LastFM since last sync: $total_scrobbles \n";
+
+	if (!$total_scrobbles) {
+		say "Nothing to do. Exiting.\n";
+		exit(0);
+	}
+
+	my $libProgress = Term::ProgressBar->new( { count => $Net::LastFMAPI::last_response->{"recenttracks"}->{"\@attr"}->{"total"}, name => "Fetching Last.fm library", ETA => "linear" } );
 
 	my $libTracks = {};
 
+	my $track_count = 0;
 	while ( my $libTrack = $libResponse->() ) {
-		my $artist = $libTrack->{"artist"}->{"name"};
+		$track_count++;
+		my $artist = $libTrack->{"artist"}->{"#text"};
 		my $track = $libTrack->{"name"};
 
-		$libTracks->{lc $artist}->{lc $track}->{"playcount"} = $libTrack->{"playcount"};
+		$libTracks->{lc $artist}->{lc $track}->{"playcount"}++;
+
+		my $play_date;
+		if ($libTrack->{"date"}) {
+			my $dt = DateTime::Format::DateParse->parse_datetime($libTrack->{"date"}->{"#text"});
+			$play_date = $epoch_parser->format_datetime($dt);
+		} else {
+			$play_date = $epoch_parser->format_datetime(DateTime->now());
+		}
+		if (!$libTracks->{lc $artist}->{lc $track}->{"lastplayed"} ||
+				($libTracks->{lc $artist}->{lc $track}->{"lastplayed"} < $play_date) ) {
+			$libTracks->{lc $artist}->{lc $track}->{"lastplayed"} = $play_date;
+		}
 
 		$libProgress->update($libCounter++);
 	}
-
+	say "Tracks processed: " . $track_count . "\n" if $self->debug;
 	#
 	# Fetch loved tracks list
 	#
@@ -187,7 +270,7 @@ sub sync {
 		try {
 			$lovedResponse = lastfm_iter(
 				"user.getLovedTracks",
-				user => $self->username,
+				user => $username,
 				limit => 250
 			);
 		};
@@ -246,12 +329,26 @@ sub sync {
 				#
 				#
 				#
+				my $new_playcount = $row->{"PlayCount"} + $lastfm_count;
+				say "\tUpdating play count to $new_playcount.";
 				$setFields = $setFields . sprintf( ($setFields ? ", " : '') . "PlayCount = %d",
-					$lastfm_count
+					$new_playcount
 				);
 				$track_changed = 1;
 			}
 
+			#
+			# compare last played date
+			#
+			my $lastplayed = $trackInfo->{"lastplayed"};
+			my $old_lastplayed = 0;
+			if ($row->{"LastPlayedStamp"}) {
+				$old_lastplayed = $row->{"LastPlayedStamp"};
+			}
+			if ($lastplayed > $old_lastplayed) {
+				$setFields = $setFields . ($setFields ? ", " : '') .
+				"LastPlayedStamp = " . $lastplayed;
+			}
 
 			#
 			# add 5 stars for a loved track if rating not set
@@ -288,6 +385,12 @@ sub sync {
 	$dbh->do('COMMIT TRANSACTION');
 	$dbh->disconnect();
 	say "Updated $changed tracks of $total total tracks";
+	
+	#
+	# Update config file with current datetime
+	#
+	$cfg->param('last_update',$epoch_parser->format_datetime(DateTime->now()));
+	$cfg->write($self->conf);
 }
 
 no Moose;
@@ -307,3 +410,5 @@ $client->backup();
 $client->sync;
 
 1;
+
+# vim: set filetype=perl noexpandtab softtabstop=0
