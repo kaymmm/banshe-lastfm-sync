@@ -18,6 +18,7 @@ use File::HomeDir;
 use Moose;
 use DateTime::Format::DateParse;
 use DateTime::Format::Epoch;
+use DateTime::TimeZone;
 use Config::Simple;
 use Data::Dumper;
 
@@ -28,9 +29,10 @@ has key => ( is => "rw", isa => "Str", required => 0, default => "b25b959554ed76
 has username => ( is => "rw", isa => "Str", required => 0);
 has db => ( is => "rw", isa => "Str", required => 0);
 has zero => ( is => "rw", isa => "Bool", required => 0, default => sub { 0 } );
-has updateloved => ( is=> "rw", isa => "Bool", required => 0, default => sub { 0 });
-has lovedrating => ( is => "rw", isa => "Int", required => 0, default => sub { 5 });
-has _config => ( is => "rw", lazy_build => 1, required => 0 );
+has matchtime => ( is => "rw", isa => "Int", required => 0, default => sub { 300 } );
+has updateloved => ( is=> "rw", isa => "Bool", required => 0, default => sub { 0 } );
+has lovedrating => ( is => "rw", isa => "Int", required => 0, default => sub { 5 } );
+# has _config => ( is => "rw", lazy_build => 1, required => 0 );
 has debug => ( is => "rw", isa => "Bool", default => sub{ 0 }, accessor => "debug" );
 has conf => ( is => "rw", isa => "Str", required => 0, default => File::HomeDir::my_home()."/.config/banshee-1/lastfm_sync.conf" );
 
@@ -85,6 +87,20 @@ sub sync {
 	my( $self ) = @_;
 
 	#
+	# allow only rating from 1 to 5
+	#
+	unless ( $self->lovedrating >= 1 && $self->lovedrating <= 5 ) {
+		say "Invalid rating '${\$self->lovedrating}'. A value from 1 to 5 is required.";
+		exit(1);
+	}
+
+	#
+	# only tracks with 0 playcount
+	#
+	my $zero  = "";
+	$zero = "AND t.PlayCount = 0" if( $self->zero );
+
+	#
 	# independent counter
 	#
 	my $counter = 1;
@@ -96,6 +112,7 @@ sub sync {
 	#
 	my $epoch_startdt = DateTime->new( year => 1970, month => 1, day => 1 );
 	my $epoch_parser = DateTime::Format::Epoch->new(epoch => $epoch_startdt);
+	my $local_time_zone = DateTime::TimeZone->new( name => 'local' )->name();
 
 	#
 	# Read config file to determine when sync was previously run.
@@ -116,7 +133,7 @@ sub sync {
 		$limit = ($cfg->param('limit') ? $cfg->param('limit') : $limit);
 		say "Last synced on " . $epoch_parser->parse_datetime($last_update)->ymd . "\n" if $self->debug;
 	} else {
-# Create a new config file
+	# Create a new config file
 		$cfg = new Config::Simple(syntax=>'ini');
 
 		$last_update = 0;
@@ -134,20 +151,6 @@ sub sync {
 		say "Error: user name not specified.\n";
 		exit(1);
 	}
-
-	#
-	# allow only rating from 1 to 5
-	#
-	unless ( $self->lovedrating >= 1 && $self->lovedrating <= 5 ) {
-		say "Invalid rating '${\$self->lovedrating}'. A value from 1 to 5 is required.";
-		exit(1);
-	}
-
-	#
-	# only tracks with 0 playcount
-	#
-	my $zero  = "";
-	$zero = "AND t.PlayCount = 0" if( $self->zero );
 
 	#
 	# check if database file exists
@@ -184,6 +187,7 @@ sub sync {
 	$sth->finish;
 
 	say "Found $total tracks to process";
+
 	#
 	# real query
 	#
@@ -206,9 +210,9 @@ sub sync {
 	$sth->execute();
 
 	#
-	# get library tracks and parse them so that we can get play counts faster
+	# get scrobbled tracks
 	#
-	say "Fetching Last.fm library..." if $self->debug;
+	say "Fetching Last.fm scrobbled tracks." if $self->debug;
 	my $libResponse = undef;
 	my $libCounter = 0;
 	try {
@@ -226,7 +230,7 @@ sub sync {
 	}
 
 	my $total_scrobbles = $Net::LastFMAPI::last_response->{"recenttracks"}->{"\@attr"}->{"total"};
-	say "Total scrobbled tracks on LastFM since last sync: $total_scrobbles \n";
+	say "Total scrobbled tracks since last sync: $total_scrobbles \n";
 
 	if (!$total_scrobbles) {
 		say "Nothing to do. Exiting.\n";
@@ -237,29 +241,33 @@ sub sync {
 
 	my $libTracks = {};
 
+	#
+	# Main loop through scrobbled tracks
+	#
 	my $track_count = 0;
 	while ( my $libTrack = $libResponse->() ) {
-		$track_count++;
 		my $artist = $libTrack->{"artist"}->{"#text"};
 		my $track = $libTrack->{"name"};
 
-		$libTracks->{lc $artist}->{lc $track}->{"playcount"}++;
 
 		my $play_date;
+		# Only process the track if it has a date associated with it (ignore now playing)
 		if ($libTrack->{"date"}) {
-			my $dt = DateTime::Format::DateParse->parse_datetime($libTrack->{"date"}->{"#text"});
-			$play_date = $epoch_parser->format_datetime($dt);
-		} else {
-			$play_date = $epoch_parser->format_datetime(DateTime->now());
-		}
-		if (!$libTracks->{lc $artist}->{lc $track}->{"lastplayed"} ||
-				($libTracks->{lc $artist}->{lc $track}->{"lastplayed"} < $play_date) ) {
-			$libTracks->{lc $artist}->{lc $track}->{"lastplayed"} = $play_date;
-		}
+			$track_count++;
+			$libTracks->{lc $artist}->{lc $track}->{"playcount"}++;
+			my $this_track_date = DateTime::Format::DateParse->parse_datetime($libTrack->{"date"}->{"#text"});
+			$this_track_date->set_time_zone('UTC');
+			$this_track_date->set_time_zone($local_time_zone);
+			$play_date = $epoch_parser->format_datetime($this_track_date);
 
-		$libProgress->update($libCounter++);
+			# add the lastplayed date to the list of play dates for the track
+			push(@{$libTracks->{lc $artist}->{lc $track}->{"lastplayed"}},$play_date);
+
+			$libProgress->update($libCounter++);
+		}
 	}
 	say "Tracks processed: " . $track_count . "\n" if $self->debug;
+
 	#
 	# Fetch loved tracks list
 	#
@@ -313,6 +321,24 @@ sub sync {
 			unless( is_int( $lastfm_count ) ) {
 				$lastfm_count = 0;
 			}
+
+			my $new_playcount = $row->{"PlayCount"};
+			while (my $playdate = shift(@{$trackInfo->{"lastplayed"}})) {
+				my $lib_lastplayed = ($row->{"LastPlayedStamp"} ? $row->{"LastPlayedStamp"} : 0);
+				# Don't increment if the play date is approximately equal (within $self->matchtime seconds) to the last played date to prevent double counting tracks scrobbled from banshee
+				if (abs($playdate - $lib_lastplayed) > $self->matchtime) {
+					$setFields = $setFields . ($setFields ? ", " : '') .
+					"LastPlayedStamp = " . $playdate;
+					$new_playcount++;
+				}
+			}
+			if ($new_playcount > $row->{"PlayCount"}) {
+				say "\tUpdating play count to $new_playcount.";
+				$setFields = $setFields . sprintf( ($setFields ? ", " : '') . "PlayCount = %d",
+					$new_playcount
+				);
+				$track_changed = 1;
+			}
 			
 			my $lastfm_loved = $trackInfo->{ "loved"};
 			unless ( is_int( $lastfm_loved) ) {
@@ -321,34 +347,7 @@ sub sync {
 
 			say "Found track $counter (${\$row->{TrackID}}) with ${ \$row->{ Name }}:${\$row->{ Title }}, play count: ${\$row->{ PlayCount}}, rating: ${\$row->{ TrackRating}}" if $self->debug;
 			say "Last.fm match is ${\$row->{Name}}:${\$row->{Title}}, play count: $lastfm_count, loved: $lastfm_loved" if $self->debug;
-			#
-			# compare playcount
-			#
-			if( $row->{ "PlayCount"} < $lastfm_count ) {
-				say "\tBanshee play count lower than last.fm play count: ${\$row->{ PlayCount}} < $lastfm_count" if $self->debug;
-				#
-				#
-				#
-				my $new_playcount = $row->{"PlayCount"} + $lastfm_count;
-				say "\tUpdating play count to $new_playcount.";
-				$setFields = $setFields . sprintf( ($setFields ? ", " : '') . "PlayCount = %d",
-					$new_playcount
-				);
-				$track_changed = 1;
-			}
 
-			#
-			# compare last played date
-			#
-			my $lastplayed = $trackInfo->{"lastplayed"};
-			my $old_lastplayed = 0;
-			if ($row->{"LastPlayedStamp"}) {
-				$old_lastplayed = $row->{"LastPlayedStamp"};
-			}
-			if ($lastplayed > $old_lastplayed) {
-				$setFields = $setFields . ($setFields ? ", " : '') .
-				"LastPlayedStamp = " . $lastplayed;
-			}
 
 			#
 			# add 5 stars for a loved track if rating not set
@@ -411,4 +410,4 @@ $client->sync;
 
 1;
 
-# vim: set filetype=perl noexpandtab softtabstop=0
+#vim:set filetype=perl noexpandtab softtabstop=0
