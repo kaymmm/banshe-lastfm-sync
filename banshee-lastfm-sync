@@ -333,7 +333,7 @@ sub sync {
 				}
 			}
 			if ($new_playcount > $row->{"PlayCount"}) {
-				say "\tUpdating play count to $new_playcount.";
+				say "\tUpdating play count to $new_playcount." if $self->debug;
 				$setFields = $setFields . sprintf( ($setFields ? ", " : '') . "PlayCount = %d",
 					$new_playcount
 				);
